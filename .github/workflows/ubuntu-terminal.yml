@@ -40,7 +40,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ttyd tmux curl ca-certificates
+          sudo apt-get install -y --no-install-recommends tmux curl ca-certificates iproute2 openssl
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
+            'https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64' \
+            --output "$RUNNER_TEMP/ttyd"
+          sudo install -m 0755 "$RUNNER_TEMP/ttyd" /usr/local/bin/ttyd
+          /usr/local/bin/ttyd --version
           version='2026.11.0'
           binary="$RUNNER_TEMP/cloudflared"
           curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
@@ -58,6 +63,10 @@ jobs:
           TERMINAL_PASSWORD: ${{ secrets.TERMINAL_PASSWORD }}
         run: |
           set -euo pipefail
+          if [[ -n "$(sudo ss -H -ltn 'sport = :17681')" ]]; then
+            echo 'Port 17681 is already occupied; refusing to use an unknown listener.' >&2
+            exit 1
+          fi
           # Only the dedicated user is exposed; no runner environment or sudo access.
           sudo systemd-run --unit=web-terminal --collect --expand-environment=no \
             --uid=webterminal --gid=webterminal \
@@ -69,9 +78,10 @@ jobs:
             --property=InaccessiblePaths=/home/runner \
             --property=ProtectProc=invisible \
             --property=KillMode=control-group \
+            --property=Type=exec \
             /usr/bin/env -i HOME=/home/webterminal USER=webterminal LOGNAME=webterminal \
             SHELL=/bin/bash PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=xterm-256color \
-            /usr/bin/ttyd --interface 127.0.0.1 --port 7681 --writable \
+            /usr/local/bin/ttyd --debug 3 --interface 127.0.0.1 --port 17681 --writable \
             --credential "terminal:$TERMINAL_PASSWORD" \
             /usr/bin/tmux new-session -A -s web
 
@@ -79,11 +89,17 @@ jobs:
           probe() {
             curl -q --noproxy '*' --http1.1 --silent --show-error \
               --connect-timeout 2 --max-time 5 --output /dev/null \
-              --write-out '%{http_code}' "$@" http://127.0.0.1:7681/
+              --write-out '%{http_code}' "$@" http://127.0.0.1:17681/
           }
           ready=false
           valid_code='000'
           for attempt in {1..30}; do
+            if ! sudo systemctl is-active --quiet web-terminal; then
+              echo 'The managed ttyd process exited before becoming ready.' >&2
+              sudo systemctl show web-terminal --property=ActiveState,SubState,Result,ExecMainStatus
+              echo "ttyd version: $(/usr/local/bin/ttyd --version 2>&1)"
+              exit 1
+            fi
             valid_code=$(probe --basic --user "terminal:$TERMINAL_PASSWORD") || valid_code='000'
             if [[ "$valid_code" == 200 ]]; then
               ready=true
@@ -96,6 +112,12 @@ jobs:
             echo "ttyd version: $(ttyd --version 2>&1)"
             # Do not dump service arguments or logs: they may contain credentials.
             sudo systemctl show web-terminal --property=ActiveState,SubState,Result,ExecMainStatus
+            exit 1
+          fi
+          main_pid=$(sudo systemctl show web-terminal --property=MainPID --value)
+          listener=$(sudo ss -H -ltnp 'sport = :17681')
+          if [[ "$main_pid" == 0 || "$listener" != *"pid=$main_pid,"* ]]; then
+            echo 'Port 17681 is not owned by the managed ttyd process; refusing to expose it.' >&2
             exit 1
           fi
           anonymous_code=$(probe --header 'Authorization:') || anonymous_code='000'
@@ -120,7 +142,7 @@ jobs:
             --property=ProtectHome=yes \
             /usr/bin/env -i HOME=/nonexistent PATH=/usr/local/bin:/usr/bin:/bin \
             /usr/local/bin/cloudflared --no-autoupdate tunnel \
-            --url http://127.0.0.1:7681 --protocol http2
+            --url http://127.0.0.1:17681 --protocol http2
 
           url=''
           for attempt in {1..60}; do
