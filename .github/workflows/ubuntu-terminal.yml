@@ -59,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           # Only the dedicated user is exposed; no runner environment or sudo access.
-          sudo systemd-run --unit=web-terminal --collect \
+          sudo systemd-run --unit=web-terminal --collect --expand-environment=no \
             --uid=webterminal --gid=webterminal \
             --property=WorkingDirectory=/home/webterminal \
             --property=NoNewPrivileges=yes \
@@ -75,22 +75,36 @@ jobs:
             --credential "terminal:$TERMINAL_PASSWORD" \
             /usr/bin/tmux new-session -A -s web
 
+          # Disable curlrc and proxy settings for deterministic local authentication checks.
+          probe() {
+            curl -q --noproxy '*' --http1.1 --silent --show-error \
+              --connect-timeout 2 --max-time 5 --output /dev/null \
+              --write-out '%{http_code}' "$@" http://127.0.0.1:7681/
+          }
           ready=false
+          valid_code='000'
           for attempt in {1..30}; do
-            if curl --silent --fail --user "terminal:$TERMINAL_PASSWORD" \
-              http://127.0.0.1:7681/ --output /dev/null; then
+            valid_code=$(probe --basic --user "terminal:$TERMINAL_PASSWORD") || valid_code='000'
+            if [[ "$valid_code" == 200 ]]; then
               ready=true
               break
             fi
             sleep 1
           done
           if [[ "$ready" != true ]]; then
-            echo 'Web terminal did not become ready.' >&2
+            echo "Web terminal did not become ready. Authenticated HTTP status: $valid_code" >&2
+            echo "ttyd version: $(ttyd --version 2>&1)"
+            # Do not dump service arguments or logs: they may contain credentials.
+            sudo systemctl show web-terminal --property=ActiveState,SubState,Result,ExecMainStatus
             exit 1
           fi
-          code=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:7681/)
-          if [[ "$code" != 401 ]]; then
+          anonymous_code=$(probe --header 'Authorization:') || anonymous_code='000'
+          invalid_code=$(probe --basic --user "terminal:invalid-$(openssl rand -hex 16)") || invalid_code='000'
+          echo "Authentication checks: valid=$valid_code, anonymous=$anonymous_code, invalid=$invalid_code (expected 200/401/401)"
+          if [[ "$anonymous_code" != 401 || "$invalid_code" != 401 ]]; then
             echo 'Authentication check failed; refusing to expose the terminal.' >&2
+            echo "ttyd version: $(ttyd --version 2>&1)"
+            sudo systemctl show web-terminal --property=ActiveState,SubState,Result,ExecMainStatus
             exit 1
           fi
 
