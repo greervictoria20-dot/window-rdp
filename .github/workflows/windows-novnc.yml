@@ -198,12 +198,13 @@ jobs:
           Write-Host 'noVNC loopback address and proxy process ownership verified.'
 
       - name: 5. Start Cloudflare Tunnel and Show URL
-        timeout-minutes: 3
+        timeout-minutes: 6
         run: |
           $ErrorActionPreference = 'Stop'
           $root = $Env:WEB_DESKTOP_ROOT
           $tunnel = Start-Process "$root\cloudflared.exe" -ArgumentList @(
-              '--no-autoupdate', 'tunnel', '--url', 'http://127.0.0.1:16080', '--protocol', 'http2'
+              '--no-autoupdate', 'tunnel', '--url', 'http://127.0.0.1:16080', '--protocol', 'http2',
+              '--metrics', '127.0.0.1:16081', '--edge-ip-version', '4'
           ) -RedirectStandardOutput "$root\tunnel.out.log" -RedirectStandardError "$root\tunnel.err.log" -PassThru
           $tunnel.Id | Set-Content "$root\tunnel.pid"
           $url = ''
@@ -218,6 +219,35 @@ jobs:
               Start-Sleep -Seconds 2
           }
           if (-not $url) { throw 'Cloudflare did not return a Quick Tunnel URL.' }
+          Write-Host 'Quick Tunnel address allocated; waiting for an active connector and public HTTP access...'
+          $ready = $false
+          $deadline = (Get-Date).AddMinutes(3)
+          $lastStatus = 'not checked'
+          while ((Get-Date) -lt $deadline) {
+              $tunnel.Refresh()
+              if ($tunnel.HasExited) { throw 'cloudflared exited while waiting for tunnel readiness.' }
+              try {
+                  $connector = Invoke-WebRequest 'http://127.0.0.1:16081/ready' -TimeoutSec 5 -SkipHttpErrorCheck
+                  if ($connector.StatusCode -eq 200) {
+                      $public = Invoke-WebRequest $url -TimeoutSec 10 -SkipHttpErrorCheck
+                      $lastStatus = "public HTTP $($public.StatusCode)"
+                      if ($public.StatusCode -eq 200 -and $public.Content -match '(?i)noVNC') {
+                          $ready = $true
+                          break
+                      }
+                  } else {
+                      $lastStatus = "connector readiness HTTP $($connector.StatusCode)"
+                  }
+              } catch {
+                  $lastStatus = $_.Exception.Message
+              }
+              Write-Host "Waiting for tunnel: $lastStatus"
+              Start-Sleep -Seconds 5
+          }
+          if (-not $ready) {
+              throw "Tunnel did not become reachable ($lastStatus). Check tunnel logs and outbound TCP 7844 connectivity."
+          }
+          Write-Host 'Cloudflare connector ready; public noVNC page verified (HTTP 200).'
           Write-Host "Desktop URL: $url"
           Write-Host 'VNC password: secret VNC_PASSWORD (not printed)'
           Write-Host 'If Windows is locked: use noVNC Ctrl-Alt-Del, then .\runneradmin / secret RDP_PASSWORD.'
@@ -244,6 +274,15 @@ jobs:
               foreach ($name in @('proxy', 'proxy-listener', 'tunnel')) {
                   $processId = [int](Get-Content "$root\$name.pid")
                   if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { throw "$name stopped." }
+              }
+              try {
+                  $connector = Invoke-WebRequest 'http://127.0.0.1:16081/ready' -TimeoutSec 5 -SkipHttpErrorCheck
+                  if ($connector.StatusCode -ne 200) {
+                      Write-Warning "Tunnel has no ready connector (HTTP $($connector.StatusCode)); cloudflared will retry."
+                      Get-Content "$root\tunnel.err.log" -Tail 12
+                  }
+              } catch {
+                  Write-Warning 'Tunnel readiness endpoint is unavailable; check the tunnel connection.'
               }
               Write-Host "[$i/$Env:DURATION_MINUTES] Desktop services running."
           }
