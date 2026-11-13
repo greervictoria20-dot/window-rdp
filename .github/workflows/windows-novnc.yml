@@ -165,9 +165,37 @@ jobs:
           }
           if (-not $ready) { throw 'noVNC HTTP server did not become ready.' }
           $listeners = @(Get-NetTCPConnection -LocalPort 16080 -State Listen)
-          if ($listeners.Count -ne 1 -or $listeners[0].LocalAddress -ne '127.0.0.1' -or $listeners[0].OwningProcess -ne $proxy.Id) {
-              throw 'Unexpected noVNC listener; refusing to open the tunnel.'
+          Write-Host "Proxy launcher PID: $($proxy.Id); listener count: $($listeners.Count)"
+          foreach ($listener in $listeners) {
+              Write-Host "Listener: $($listener.LocalAddress):$($listener.LocalPort), PID $($listener.OwningProcess)"
           }
+          if ($listeners.Count -ne 1 -or $listeners[0].LocalAddress -ne '127.0.0.1') {
+              throw 'noVNC must listen only on 127.0.0.1:16080; refusing to open the tunnel.'
+          }
+
+          # Windows venv python.exe can launch the base interpreter as a child.
+          $listenerId = [int]$listeners[0].OwningProcess
+          $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerId"
+          if (-not $owner -or $owner.Name -ine 'python.exe' -or
+              $owner.CommandLine -notmatch '(?i)\s-m\s+websockify(?:\s|$)') {
+              throw 'The noVNC listener is not the expected Python websockify process.'
+          }
+          $currentId = $listenerId
+          $verified = $false
+          for ($depth = 0; $depth -lt 8; $depth++) {
+              if ($currentId -eq $proxy.Id) { $verified = $true; break }
+              $current = Get-CimInstance Win32_Process -Filter "ProcessId = $currentId"
+              if (-not $current -or $current.ParentProcessId -eq 0 -or
+                  $current.CreationDate -lt $proxy.StartTime.AddSeconds(-2)) { break }
+              Write-Host "Proxy process chain: PID $currentId, parent $($current.ParentProcessId), name $($current.Name)"
+              $currentId = [int]$current.ParentProcessId
+          }
+          $proxy.Refresh()
+          if (-not $verified -or $proxy.HasExited) {
+              throw 'The listener does not belong to the running proxy process tree; refusing to open the tunnel.'
+          }
+          $listenerId | Set-Content "$root\proxy-listener.pid"
+          Write-Host 'noVNC loopback address and proxy process ownership verified.'
 
       - name: 5. Start Cloudflare Tunnel and Show URL
         timeout-minutes: 3
@@ -213,7 +241,7 @@ jobs:
           for ($i = 1; $i -le [int]$Env:DURATION_MINUTES; $i++) {
               Start-Sleep -Seconds 60
               if ((Get-Service tvnserver).Status -ne 'Running') { throw 'TightVNC stopped.' }
-              foreach ($name in @('proxy', 'tunnel')) {
+              foreach ($name in @('proxy', 'proxy-listener', 'tunnel')) {
                   $processId = [int](Get-Content "$root\$name.pid")
                   if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { throw "$name stopped." }
               }
