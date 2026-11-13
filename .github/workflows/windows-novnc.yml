@@ -149,10 +149,25 @@ jobs:
           & $python "$root\check-vnc.py"
           if ($LASTEXITCODE -ne 0) { throw 'VNC authentication validation failed; tunnel will not start.' }
           Remove-Item Env:VNC_PASSWORD
-          $proxy = Start-Process $python -ArgumentList @(
+          @'
+          $ErrorActionPreference = 'Stop'
+          $root = $PSScriptRoot
+          $proxy = Start-Process "$root\venv\Scripts\python.exe" -ArgumentList @(
               '-m', 'websockify', '--web', "`"$root\noVNC-1.6.0`"", '127.0.0.1:16080', '127.0.0.1:5900'
           ) -RedirectStandardOutput "$root\proxy.out.log" -RedirectStandardError "$root\proxy.err.log" -PassThru
           $proxy.Id | Set-Content "$root\proxy.pid"
+          $proxy.WaitForExit()
+          "Proxy exited at $(Get-Date -Format o), code $($proxy.ExitCode)" | Add-Content "$root\proxy.err.log"
+          exit 1
+          '@ | Set-Content "$root\run-proxy.ps1" -Encoding utf8
+          $action = New-ScheduledTaskAction -Execute (Get-Command pwsh.exe).Source -Argument "-NoProfile -NonInteractive -File `"$root\run-proxy.ps1`"" -WorkingDirectory $root
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+          Register-ScheduledTask -TaskName 'WebDesktopProxy' -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+          Start-ScheduledTask -TaskName 'WebDesktopProxy'
+          for ($i = 0; $i -lt 30 -and -not (Test-Path "$root\proxy.pid"); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path "$root\proxy.pid")) { throw 'Scheduled proxy did not start; see task diagnostics.' }
+          $proxy = Get-Process -Id ([int](Get-Content "$root\proxy.pid"))
           $ready = $false
           for ($i = 0; $i -lt 30; $i++) {
               $proxy.Refresh()
@@ -202,11 +217,26 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $root = $Env:WEB_DESKTOP_ROOT
+          @'
+          $ErrorActionPreference = 'Stop'
+          $root = $PSScriptRoot
           $tunnel = Start-Process "$root\cloudflared.exe" -ArgumentList @(
               '--no-autoupdate', 'tunnel', '--url', 'http://127.0.0.1:16080', '--protocol', 'http2',
               '--metrics', '127.0.0.1:16081', '--edge-ip-version', '4'
           ) -RedirectStandardOutput "$root\tunnel.out.log" -RedirectStandardError "$root\tunnel.err.log" -PassThru
           $tunnel.Id | Set-Content "$root\tunnel.pid"
+          $tunnel.WaitForExit()
+          "Tunnel exited at $(Get-Date -Format o), code $($tunnel.ExitCode)" | Add-Content "$root\tunnel.err.log"
+          exit 1
+          '@ | Set-Content "$root\run-tunnel.ps1" -Encoding utf8
+          $action = New-ScheduledTaskAction -Execute (Get-Command pwsh.exe).Source -Argument "-NoProfile -NonInteractive -File `"$root\run-tunnel.ps1`"" -WorkingDirectory $root
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+          Register-ScheduledTask -TaskName 'WebDesktopTunnel' -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+          Start-ScheduledTask -TaskName 'WebDesktopTunnel'
+          for ($i = 0; $i -lt 30 -and -not (Test-Path "$root\tunnel.pid"); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path "$root\tunnel.pid")) { throw 'Scheduled tunnel did not start; see task diagnostics.' }
+          $tunnel = Get-Process -Id ([int](Get-Content "$root\tunnel.pid"))
           $url = ''
           for ($i = 0; $i -lt 60; $i++) {
               $tunnel.Refresh()
@@ -328,7 +358,14 @@ jobs:
       - name: Diagnostics on Failure
         if: failure()
         run: |
-          foreach ($name in @('proxy.err.log', 'tunnel.err.log')) {
+          foreach ($taskName in @('WebDesktopProxy', 'WebDesktopTunnel')) {
+              $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+              if ($task) {
+                  $task | Select-Object TaskName, State | Format-Table
+                  Get-ScheduledTaskInfo -TaskName $taskName | Select-Object LastRunTime, LastTaskResult | Format-List
+              }
+          }
+          foreach ($name in @('proxy.out.log', 'proxy.err.log', 'tunnel.err.log')) {
               $path = Join-Path $Env:WEB_DESKTOP_ROOT $name
               if (Test-Path $path) { Get-Content $path -Tail 40 }
           }
@@ -344,6 +381,12 @@ jobs:
                       $processId = [int](Get-Content $path)
                       taskkill.exe /PID $processId /T /F 2>$null | Out-Null
                   }
+              }
+          }
+          foreach ($taskName in @('WebDesktopTunnel', 'WebDesktopProxy')) {
+              if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+                  Stop-ScheduledTask -TaskName $taskName -ErrorAction Continue
+                  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
               }
           }
           $service = Get-Service tvnserver -ErrorAction SilentlyContinue
