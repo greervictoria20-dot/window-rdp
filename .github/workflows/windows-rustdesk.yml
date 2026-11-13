@@ -1,0 +1,187 @@
+name: Windows Cloud RustDesk
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 1. Set Windows Login Password
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($Env:RDP_PASSWORD)) {
+              throw 'Secret RDP_PASSWORD is not set'
+          }
+          $remotePassword = $Env:RUSTDESK_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($remotePassword)) {
+              $remotePassword = $Env:RDP_PASSWORD
+          }
+          if ($remotePassword.Length -lt 12) {
+              throw 'Use at least 12 characters for RUSTDESK_PASSWORD (or RDP_PASSWORD when omitted)'
+          }
+
+          $password = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name 'NvdAdmin' -ErrorAction SilentlyContinue
+          if ($null -eq $user) {
+              New-LocalUser -Name 'NvdAdmin' -Password $password -PasswordNeverExpires | Out-Null
+          } else {
+              Set-LocalUser -Name 'NvdAdmin' -Password $password
+          }
+          $admins = Get-LocalGroup -SID 'S-1-5-32-544'
+          $members = Get-LocalGroupMember -Group $admins
+          $user = Get-LocalUser -Name 'NvdAdmin'
+          if ($user.SID.Value -notin $members.SID.Value) {
+              Add-LocalGroupMember -Group $admins -Member $user
+          }
+          Set-LocalUser -Name 'runneradmin' -Password $password
+
+      - name: 2. Install RustDesk
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '1.5.3'
+          $expectedHash = '27f6bfb48a93d524860dd7f4a79e349be14b6dc71295746cf132a060ba4869c8'
+          $installer = Join-Path $Env:RUNNER_TEMP 'rustdesk.msi'
+          Invoke-WebRequest "https://github.com/rustdesk/rustdesk/releases/download/$version/rustdesk-$version-x86_64.msi" -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $expectedHash) {
+              throw 'RustDesk installer SHA256 verification failed'
+          }
+          $setup = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart INSTALLPRINTER=N" -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) {
+              throw "RustDesk installation failed: exit code $($setup.ExitCode)"
+          }
+          $exe = Join-Path $Env:ProgramFiles 'RustDesk\rustdesk.exe'
+          if (-not (Test-Path $exe)) {
+              throw "RustDesk executable not found: $exe"
+          }
+          "RUSTDESK_EXE=$exe" >> $Env:GITHUB_ENV
+
+          $service = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
+          if ($null -eq $service) {
+              $install = Start-Process $exe -ArgumentList '--install-service' -Wait -PassThru
+              if ($install.ExitCode -ne 0) {
+                  throw 'Could not install the RustDesk service'
+              }
+          }
+          Set-Service -Name 'RustDesk' -StartupType Automatic
+          Start-Service -Name 'RustDesk'
+          (Get-Service -Name 'RustDesk').WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+
+      - name: 3. Configure Unattended Access and Show ID
+        timeout-minutes: 5
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
+          # Optional: export the server config from Settings > Network in RustDesk.
+          RUSTDESK_CONFIG: ${{ secrets.RUSTDESK_CONFIG }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # ArgumentList preserves spaces and quotes in passwords without shell interpolation.
+          function Invoke-RustDesk {
+              param([string[]]$CliArgs)
+              $info = [System.Diagnostics.ProcessStartInfo]::new()
+              $info.FileName = $Env:RUSTDESK_EXE
+              $info.UseShellExecute = $false
+              $info.CreateNoWindow = $true
+              $info.RedirectStandardOutput = $true
+              $info.RedirectStandardError = $true
+              foreach ($argument in $CliArgs) {
+                  $info.ArgumentList.Add($argument)
+              }
+              $process = [System.Diagnostics.Process]::Start($info)
+              $stdout = $process.StandardOutput.ReadToEndAsync()
+              $stderr = $process.StandardError.ReadToEndAsync()
+              if (-not $process.WaitForExit(30000)) {
+                  $process.Kill($true)
+                  throw "RustDesk command timed out: $($CliArgs[0])"
+              }
+              $output = $stdout.GetAwaiter().GetResult()
+              $null = $stderr.GetAwaiter().GetResult()
+              if ($process.ExitCode -ne 0) {
+                  throw "RustDesk command failed: $($CliArgs[0]), exit code $($process.ExitCode)"
+              }
+              $process.Dispose()
+              return $output.Trim()
+          }
+
+          Start-Sleep -Seconds 5
+          if (-not [string]::IsNullOrWhiteSpace($Env:RUSTDESK_CONFIG)) {
+              $null = Invoke-RustDesk -CliArgs @('--config', $Env:RUSTDESK_CONFIG)
+              Restart-Service -Name 'RustDesk'
+              (Get-Service -Name 'RustDesk').WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+              Start-Sleep -Seconds 5
+              Write-Host 'Custom server configuration applied. Configure your controlling client to use the same server.'
+          } else {
+              Write-Host 'Using the default RustDesk public servers. Availability is not guaranteed.'
+          }
+
+          $remotePassword = $Env:RUSTDESK_PASSWORD
+          $passwordSource = 'RUSTDESK_PASSWORD'
+          if ([string]::IsNullOrWhiteSpace($remotePassword)) {
+              $remotePassword = $Env:RDP_PASSWORD
+              $passwordSource = 'RDP_PASSWORD'
+          }
+          $null = Invoke-RustDesk -CliArgs @('--password', $remotePassword)
+
+          $deviceId = ''
+          $deadline = (Get-Date).AddMinutes(2)
+          while ((Get-Date) -lt $deadline) {
+              $candidate = Invoke-RustDesk -CliArgs @('--get-id')
+              if ($candidate -match '^\d{6,16}$' -and $candidate -notmatch '^0+$') {
+                  $deviceId = $candidate
+                  break
+              }
+              Start-Sleep -Seconds 5
+          }
+          if (-not $deviceId) {
+              throw 'RustDesk did not return a device ID within 2 minutes'
+          }
+
+          Write-Host ''
+          Write-Host '=========================================='
+          Write-Host '  RustDesk service configured'
+          Write-Host "  RustDesk ID       : $deviceId"
+          Write-Host "  Remote password   : secret $passwordSource"
+          Write-Host '  Windows login     : .\runneradmin (existing session)'
+          Write-Host '  Alternative login : .\NvdAdmin'
+          Write-Host '  Windows password  : secret RDP_PASSWORD'
+          Write-Host '  Connect using the RustDesk client, not mstsc.'
+          Write-Host '  An ID alone does not confirm server registration or desktop capture.'
+          Write-Host '  Browser access requires a compatible web client and server WebSocket/WSS setup.'
+          Write-Host '=========================================='
+
+      - name: 4. Keep Host Available (340 Minutes)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 1; $i -le 340; $i++) {
+              Start-Sleep -Seconds 60
+              $service = Get-Service -Name 'RustDesk'
+              if ($service.Status -ne 'Running') {
+                  throw 'RustDesk service has stopped'
+              }
+              Write-Host "[$i/340] RustDesk service running..."
+          }
+
+      - name: 5. Stop RustDesk
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $service = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
+          if ($service) {
+              Set-Service -Name 'RustDesk' -StartupType Disabled
+              Stop-Service -Name 'RustDesk' -Force
+          }
+          Get-Process -Name 'rustdesk' -ErrorAction SilentlyContinue | Stop-Process -Force
