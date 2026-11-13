@@ -1,0 +1,133 @@
+name: Windows Cloud CrossDesk
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 1. Set Windows Login Password
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($Env:RDP_PASSWORD)) {
+              throw 'Secret RDP_PASSWORD is not set'
+          }
+
+          $password = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name 'NvdAdmin' -ErrorAction SilentlyContinue
+          if ($null -eq $user) {
+              New-LocalUser -Name 'NvdAdmin' -Password $password -PasswordNeverExpires | Out-Null
+          } else {
+              Set-LocalUser -Name 'NvdAdmin' -Password $password
+          }
+          $admins = Get-LocalGroup -SID 'S-1-5-32-544'
+          $members = Get-LocalGroupMember -Group $admins
+          $user = Get-LocalUser -Name 'NvdAdmin'
+          if ($user.SID.Value -notin $members.SID.Value) {
+              Add-LocalGroupMember -Group $admins -Member $user
+          }
+          Set-LocalUser -Name 'runneradmin' -Password $password
+
+      - name: 2. Install CrossDesk
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = 'v1.7.0-20261014'
+          $installer = Join-Path $Env:RUNNER_TEMP 'crossdesk-setup.exe'
+          $installDir = Join-Path $Env:ProgramFiles 'CrossDesk'
+          Invoke-WebRequest "https://downloads.crossdesk.cn/crossdesk-win-x64-$version.exe" -OutFile $installer
+
+          # NSIS requires /D to be the last argument, without surrounding quotes.
+          $setup = Start-Process -FilePath $installer -ArgumentList "/S /D=$installDir" -Wait -PassThru
+          if ($setup.ExitCode -ne 0) {
+              throw "CrossDesk installation failed: exit code $($setup.ExitCode)"
+          }
+          $exe = Join-Path $installDir 'CrossDesk.exe'
+          if (-not (Test-Path $exe)) {
+              throw "CrossDesk executable not found: $exe"
+          }
+          "CROSSDESK_EXE=$exe" >> $Env:GITHUB_ENV
+
+      - name: 3. Enable CrossDesk Unattended Access
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $process = Start-Process -FilePath $Env:CROSSDESK_EXE -ArgumentList '--unattended-enable' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+              throw "Could not enable CrossDesk unattended access: exit code $($process.ExitCode)"
+          }
+
+          # Read the private status file instead of printing raw diagnostic logs.
+          $statusPath = Join-Path $Env:ProgramData 'CrossDeskUnattended\status.json'
+          $status = $null
+          $ready = $false
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+              if (Test-Path $statusPath) {
+                  try {
+                      $status = Get-Content $statusPath -Raw | ConvertFrom-Json
+                      $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$status.updated_at
+                      $hostProcess = Get-Process -Id $status.process_id -ErrorAction SilentlyContinue
+                      if ($status.online -and $status.device_id -match '^\d{9}$' -and
+                          $status.password -and $hostProcess -and $age -ge 0 -and $age -lt 10) {
+                          $ready = $true
+                          break
+                      }
+                  } catch {
+                      # The host may be replacing the status file; retry shortly.
+                  }
+              }
+              Start-Sleep -Seconds 3
+          }
+          if (-not $ready) {
+              throw 'CrossDesk did not come online within 3 minutes. Check service/network availability.'
+          }
+
+          Write-Warning 'The CrossDesk password below is visible to everyone who can read this workflow log.'
+          Write-Host ''
+          Write-Host '=========================================='
+          Write-Host '  CrossDesk host is online'
+          Write-Host "  Device ID          : $($status.device_id)"
+          Write-Host "  CrossDesk password : $($status.password)"
+          Write-Host '  Connect using CrossDesk or https://web.crossdesk.cn/'
+          Write-Host '  Windows login      : .\runneradmin (existing session)'
+          Write-Host '  Alternative login  : .\NvdAdmin'
+          Write-Host '  Windows password   : secret RDP_PASSWORD'
+          Write-Host '  Do not use mstsc: CrossDesk is not an RDP VPN.'
+          Write-Host '=========================================='
+
+      - name: 4. Keep Host Available (340 Minutes)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 1; $i -le 340; $i++) {
+              Start-Sleep -Seconds 60
+              $service = Get-Service -Name 'CrossDeskService'
+              if ($service.Status -ne 'Running') {
+                  throw 'CrossDeskService has stopped'
+              }
+              Write-Host "[$i/340] CrossDesk service running..."
+          }
+
+      - name: 5. Stop CrossDesk
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($Env:CROSSDESK_EXE -and (Test-Path $Env:CROSSDESK_EXE)) {
+              $process = Start-Process -FilePath $Env:CROSSDESK_EXE -ArgumentList '--unattended-disable' -Wait -PassThru
+              if ($process.ExitCode -ne 0) {
+                  Stop-Service -Name 'CrossDeskService' -Force -ErrorAction Continue
+                  throw "Could not disable unattended access: exit code $($process.ExitCode)"
+              }
+          }
