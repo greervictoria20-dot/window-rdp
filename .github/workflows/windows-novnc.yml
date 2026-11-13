@@ -198,7 +198,7 @@ jobs:
           Write-Host 'noVNC loopback address and proxy process ownership verified.'
 
       - name: 5. Start Cloudflare Tunnel and Show URL
-        timeout-minutes: 6
+        timeout-minutes: 9
         run: |
           $ErrorActionPreference = 'Stop'
           $root = $Env:WEB_DESKTOP_ROOT
@@ -221,27 +221,65 @@ jobs:
           if (-not $url) { throw 'Cloudflare did not return a Quick Tunnel URL.' }
           Write-Host 'Quick Tunnel address allocated; waiting for an active connector and public HTTP access...'
           $ready = $false
-          $deadline = (Get-Date).AddMinutes(3)
+          $deadline = (Get-Date).AddMinutes(5)
           $lastStatus = 'not checked'
+          $attempt = 0
+          $hostname = ([uri]$url).DnsSafeHost
           while ((Get-Date) -lt $deadline) {
+              $attempt++
               $tunnel.Refresh()
               if ($tunnel.HasExited) { throw 'cloudflared exited while waiting for tunnel readiness.' }
+              foreach ($name in @('proxy', 'proxy-listener')) {
+                  $processId = [int](Get-Content "$root\$name.pid")
+                  if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+                      throw "$name exited before the tunnel became ready. Check proxy.err.log."
+                  }
+              }
+              # Local probes bypass proxies; verify the origin using the public Host header too.
               try {
-                  $connector = Invoke-WebRequest 'http://127.0.0.1:16081/ready' -TimeoutSec 5 -SkipHttpErrorCheck
+                  $origin = Invoke-WebRequest 'http://127.0.0.1:16080/vnc.html' -Headers @{ Host = $hostname } -NoProxy -TimeoutSec 5 -SkipHttpErrorCheck
+                  if ($origin.StatusCode -ne 200 -or $origin.Content -notmatch '(?i)noVNC') {
+                      throw "Unexpected origin response: HTTP $($origin.StatusCode)"
+                  }
+              } catch {
+                  throw "Local noVNC origin is unavailable: $($_.Exception.Message)"
+              }
+              try {
+                  $connector = Invoke-WebRequest 'http://127.0.0.1:16081/ready' -NoProxy -TimeoutSec 5 -SkipHttpErrorCheck
                   if ($connector.StatusCode -eq 200) {
-                      $public = Invoke-WebRequest $url -TimeoutSec 10 -SkipHttpErrorCheck
-                      $lastStatus = "public HTTP $($public.StatusCode)"
+                      $public = Invoke-WebRequest $url -NoProxy -TimeoutSec 10 -SkipHttpErrorCheck
+                      $lastStatus = "origin=200, connector=200, public=$($public.StatusCode)"
                       if ($public.StatusCode -eq 200 -and $public.Content -match '(?i)noVNC') {
                           $ready = $true
                           break
                       }
+                      if ($public.StatusCode -eq 502 -and $attempt % 4 -eq 0) {
+                          Write-Host 'Recent tunnel errors (origin HTTP is working locally):'
+                          Get-Content "$root\tunnel.err.log" -Tail 15
+                          Write-Host 'Recent WebSocket proxy logs:'
+                          Get-Content "$root\proxy.err.log" -Tail 10
+                      }
                   } else {
-                      $lastStatus = "connector readiness HTTP $($connector.StatusCode)"
+                      $lastStatus = "origin=200, connector readiness HTTP $($connector.StatusCode)"
                   }
               } catch {
-                  $lastStatus = $_.Exception.Message
+                  $lastStatus = "origin=200, external probe error: $($_.Exception.Message)"
               }
               Write-Host "Waiting for tunnel: $lastStatus"
+              if ($attempt % 6 -eq 0) {
+                  foreach ($resolver in @('', '1.1.1.1')) {
+                      $label = if ($resolver) { $resolver } else { 'system DNS' }
+                      try {
+                          $dnsParams = @{ Name = $hostname; Type = 'A'; DnsOnly = $true; ErrorAction = 'Stop' }
+                          if ($resolver) { $dnsParams.Server = $resolver }
+                          $addresses = Resolve-DnsName @dnsParams | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress
+                          Write-Host "DNS [$label]: $($addresses -join ', ')"
+                      } catch {
+                          Write-Host "DNS [$label]: $($_.Exception.Message)"
+                      }
+                  }
+                  Clear-DnsClientCache
+              }
               Start-Sleep -Seconds 5
           }
           if (-not $ready) {
