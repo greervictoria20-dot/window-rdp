@@ -43,6 +43,67 @@ jobs:
           New-Item -ItemType Directory -Path $root -Force | Out-Null
           "WEB_DESKTOP_ROOT=$root" >> $Env:GITHUB_ENV
 
+      - name: Install NetEase UU Remote
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $Env:WEB_DESKTOP_ROOT 'uu-remote-setup.exe'
+          # Pinned official download and SHA256 from the NetEase.UURemote winget manifest.
+          Invoke-WebRequest 'https://a56.gdl.netease.com/UURemote_Setup_4.47.0.5146_1112133553_gwqd.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne 'FB2D24A40A51AE82701AE2D145DB387DF4FB63F8BAD2D020DB4AFCCDA928195E') {
+              throw 'UU Remote installer SHA256 verification failed.'
+          }
+          $setup = Start-Process $installer -ArgumentList '/S' -PassThru
+          if (-not $setup.WaitForExit(300000)) {
+              Stop-Process -Id $setup.Id -Force -ErrorAction SilentlyContinue
+              throw 'UU Remote silent installation timed out.'
+          }
+          if ($setup.ExitCode -ne 0) { throw "UU Remote installation failed: $($setup.ExitCode)" }
+          $uninstallKeys = @(
+              'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $installed = Get-ItemProperty $uninstallKeys -ErrorAction SilentlyContinue |
+              Where-Object { $_.PSChildName -eq 'GameViewer' -or $_.DisplayName -match 'UU.*远程|UU.*Remote|GameViewer' } |
+              Select-Object -First 1
+          if (-not $installed) { throw 'UU Remote installer exited, but its installation registration was not found.' }
+          Write-Host "Installed: $($installed.DisplayName) $($installed.DisplayVersion)"
+          '### UU Remote: installed. Open it from the Windows Start menu and complete login/authorization manually.' >> $Env:GITHUB_STEP_SUMMARY
+
+      - name: Install Chinese Input Support (Microsoft Pinyin)
+        timeout-minutes: 15
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+              $capabilityName = 'Language.Basic~~~zh-CN~0.0.1.0'
+              $capability = Get-WindowsCapability -Online -Name $capabilityName
+              if (-not $capability) { throw 'Chinese Basic language capability is unavailable on this Windows Server image.' }
+              if ($capability.State -ne 'Installed') {
+                  $result = Add-WindowsCapability -Online -Name $capabilityName
+                  if ($result.RestartNeeded) {
+                      Write-Warning 'Windows reports that language components need a restart. This workflow will not reboot the Runner.'
+                  }
+              }
+              if ((Get-WindowsCapability -Online -Name $capabilityName).State -ne 'Installed') {
+                  throw 'Chinese Basic language capability was not installed.'
+              }
+              $languages = Get-WinUserLanguageList
+              if ('zh-CN' -notin $languages.LanguageTag) { $languages.Add('zh-CN') }
+              $chinese = $languages | Where-Object LanguageTag -eq 'zh-CN' | Select-Object -First 1
+              $pinyin = '0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}'
+              if ($pinyin -notin $chinese.InputMethodTips) { $chinese.InputMethodTips.Add($pinyin) }
+              Set-WinUserLanguageList $languages -Force
+              Start-Process "$Env:WINDIR\System32\ctfmon.exe"
+              Get-WinUserLanguageList | Select-Object LanguageTag, InputMethodTips | Format-List
+              '### Chinese input: Microsoft Pinyin configured for runneradmin. Use Win+Space to select Chinese, then Shift to toggle Chinese/English. A new login may be needed; do not reboot the Runner.' >> $Env:GITHUB_STEP_SUMMARY
+          } catch {
+              '### Chinese input: installation/configuration FAILED. Check the Chinese input step log; Windows Server language component downloads may be unavailable. The remote desktop will still start.' >> $Env:GITHUB_STEP_SUMMARY
+              Write-Warning $_.Exception.Message
+              throw
+          }
+
       - name: 2. Install TightVNC Service
         timeout-minutes: 5
         env:
