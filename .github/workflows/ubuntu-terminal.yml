@@ -1,0 +1,156 @@
+name: Ubuntu Web Terminal
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Session duration in minutes (1-330)'
+        required: true
+        default: '300'
+        type: string
+
+permissions: {}
+
+jobs:
+  terminal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 1. Validate Settings
+        env:
+          TERMINAL_PASSWORD: ${{ secrets.TERMINAL_PASSWORD }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          set -euo pipefail
+          if [[ ${#TERMINAL_PASSWORD} -lt 16 || "$TERMINAL_PASSWORD" == *$'\n'* || "$TERMINAL_PASSWORD" == *$'\r'* ]]; then
+            echo 'Set TERMINAL_PASSWORD to a single-line password of at least 16 characters.' >&2
+            exit 1
+          fi
+          if [[ ! "$DURATION_MINUTES" =~ ^[1-9][0-9]{0,2}$ ]] || (( DURATION_MINUTES > 330 )); then
+            echo 'duration_minutes must be an integer from 1 to 330.' >&2
+            exit 1
+          fi
+
+      - name: 2. Install ttyd, tmux and cloudflared
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ttyd tmux curl ca-certificates
+          version='2026.11.0'
+          binary="$RUNNER_TEMP/cloudflared"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
+            "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-amd64" \
+            --output "$binary"
+          echo "51f7c68b57ed7269164075d7e789efce5b59355982f06392deeb037d982a51fd  $binary" | sha256sum --check
+          sudo install -m 0755 "$binary" /usr/local/bin/cloudflared
+          sudo useradd --create-home --shell /bin/bash webterminal
+          sudo chmod 700 /home/webterminal
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin cf-tunnel
+
+      - name: 3. Start Password-Protected Web Terminal
+        timeout-minutes: 2
+        env:
+          TERMINAL_PASSWORD: ${{ secrets.TERMINAL_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Only the dedicated user is exposed; no runner environment or sudo access.
+          sudo systemd-run --unit=web-terminal --collect \
+            --uid=webterminal --gid=webterminal \
+            --property=WorkingDirectory=/home/webterminal \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=ReadWritePaths=/home/webterminal \
+            --property=InaccessiblePaths=/home/runner \
+            --property=ProtectProc=invisible \
+            --property=KillMode=control-group \
+            /usr/bin/env -i HOME=/home/webterminal USER=webterminal LOGNAME=webterminal \
+            SHELL=/bin/bash PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=xterm-256color \
+            /usr/bin/ttyd --interface 127.0.0.1 --port 7681 --writable \
+            --credential "terminal:$TERMINAL_PASSWORD" \
+            /usr/bin/tmux new-session -A -s web
+
+          ready=false
+          for attempt in {1..30}; do
+            if curl --silent --fail --user "terminal:$TERMINAL_PASSWORD" \
+              http://127.0.0.1:7681/ --output /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            echo 'Web terminal did not become ready.' >&2
+            exit 1
+          fi
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:7681/)
+          if [[ "$code" != 401 ]]; then
+            echo 'Authentication check failed; refusing to expose the terminal.' >&2
+            exit 1
+          fi
+
+      - name: 4. Start Cloudflare Quick Tunnel
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          sudo systemd-run --unit=web-terminal-tunnel --collect \
+            --uid=cf-tunnel --gid=cf-tunnel \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=ProtectHome=yes \
+            /usr/bin/env -i HOME=/nonexistent PATH=/usr/local/bin:/usr/bin:/bin \
+            /usr/local/bin/cloudflared --no-autoupdate tunnel \
+            --url http://127.0.0.1:7681 --protocol http2
+
+          url=''
+          for attempt in {1..60}; do
+            url=$(sudo journalctl -u web-terminal-tunnel --no-pager -o cat | \
+              grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -n 1 || true)
+            if [[ -n "$url" ]]; then
+              break
+            fi
+            sleep 2
+          done
+          if [[ -z "$url" ]]; then
+            echo 'Cloudflare did not return a Quick Tunnel URL.' >&2
+            sudo journalctl -u web-terminal-tunnel --no-pager -n 40
+            exit 1
+          fi
+          echo "Web terminal: $url"
+          echo 'Username: terminal'
+          echo 'Password: the value of secret TERMINAL_PASSWORD (not printed)'
+          echo 'Allow a short delay for the tunnel to become reachable.'
+          {
+            echo '## Ubuntu Web Terminal'
+            echo
+            echo "- URL: $url"
+            echo '- Login username: `terminal`'
+            echo '- Password: your `TERMINAL_PASSWORD` secret'
+            echo '- Linux user: `webterminal` (no sudo)'
+            echo '- Reconnect to resume the tmux session; closing the browser does not stop the job.'
+            echo '- Data is temporary and disappears when the job ends. Never remove authentication.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 5. Keep Session Available
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          set -euo pipefail
+          for ((minute=1; minute<=DURATION_MINUTES; minute++)); do
+            sleep 60
+            sudo systemctl is-active --quiet web-terminal
+            sudo systemctl is-active --quiet web-terminal-tunnel
+            echo "[$minute/$DURATION_MINUTES] Terminal and tunnel services running."
+          done
+
+      - name: 6. Stop Tunnel and Terminal
+        if: always()
+        timeout-minutes: 2
+        run: |
+          sudo systemctl stop web-terminal-tunnel.service web-terminal.service || true
