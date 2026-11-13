@@ -55,6 +55,9 @@ jobs:
           sudo install -m 0755 "$binary" /usr/local/bin/cloudflared
           sudo useradd --create-home --shell /bin/bash webterminal
           sudo chmod 700 /home/webterminal
+          echo 'webterminal ALL=(ALL:ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/webterminal > /dev/null
+          sudo chmod 0440 /etc/sudoers.d/webterminal
+          sudo visudo -cf /etc/sudoers.d/webterminal
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin cf-tunnel
 
       - name: 3. Start Password-Protected Web Terminal
@@ -67,16 +70,10 @@ jobs:
             echo 'Port 17681 is already occupied; refusing to use an unknown listener.' >&2
             exit 1
           fi
-          # Only the dedicated user is exposed; no runner environment or sudo access.
+          # The shell starts with a clean environment, but sudo grants full VM access.
           sudo systemd-run --unit=web-terminal --collect --expand-environment=no \
             --uid=webterminal --gid=webterminal \
             --property=WorkingDirectory=/home/webterminal \
-            --property=NoNewPrivileges=yes \
-            --property=PrivateTmp=yes \
-            --property=ProtectSystem=strict \
-            --property=ReadWritePaths=/home/webterminal \
-            --property=InaccessiblePaths=/home/runner \
-            --property=ProtectProc=invisible \
             --property=KillMode=control-group \
             --property=Type=exec \
             /usr/bin/env -i HOME=/home/webterminal USER=webterminal LOGNAME=webterminal \
@@ -168,7 +165,8 @@ jobs:
             echo "- URL: $url"
             echo '- Login username: `terminal`'
             echo '- Password: your `TERMINAL_PASSWORD` secret'
-            echo '- Linux user: `webterminal` (no sudo)'
+            echo '- Linux user: `webterminal`; run `sudo -i` or `sudo su -` for root.'
+            echo '- WARNING: terminal credentials grant full VM access, including runner files. Do not share them.'
             echo '- Reconnect to resume the tmux session; closing the browser does not stop the job.'
             echo '- Data is temporary and disappears when the job ends. Never remove authentication.'
           } >> "$GITHUB_STEP_SUMMARY"
