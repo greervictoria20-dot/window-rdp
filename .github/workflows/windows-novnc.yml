@@ -1,0 +1,246 @@
+name: Windows Web Desktop (Cloudflare)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Session duration in minutes (1-330)'
+        required: true
+        default: '300'
+        type: string
+
+permissions: {}
+
+jobs:
+  desktop:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 1. Validate Settings and Set Windows Password
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Classic VNC authentication only uses eight password bytes.
+          if ($Env:VNC_PASSWORD -cnotmatch '^[A-Za-z0-9]{8}$') {
+              throw 'Set VNC_PASSWORD to exactly 8 random ASCII letters/digits. Do not reuse another password.'
+          }
+          if ([string]::IsNullOrWhiteSpace($Env:RDP_PASSWORD)) {
+              throw 'Set RDP_PASSWORD to a strong Windows login password.'
+          }
+          if ($Env:DURATION_MINUTES -notmatch '^[1-9][0-9]{0,2}$' -or [int]$Env:DURATION_MINUTES -gt 330) {
+              throw 'duration_minutes must be an integer from 1 to 330.'
+          }
+          $password = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          Set-LocalUser -Name 'runneradmin' -Password $password
+          $root = Join-Path $Env:RUNNER_TEMP 'web-desktop'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          "WEB_DESKTOP_ROOT=$root" >> $Env:GITHUB_ENV
+
+      - name: 2. Install TightVNC Service
+        timeout-minutes: 5
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-NetTCPConnection -LocalPort 5900, 16080 -State Listen -ErrorAction SilentlyContinue) {
+              throw 'A required port is already occupied.'
+          }
+          $installer = Join-Path $Env:WEB_DESKTOP_ROOT 'tightvnc.msi'
+          Invoke-WebRequest 'https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi' -OutFile $installer
+          $arguments = @(
+              '/i', "`"$installer`"", '/qn', '/norestart', 'ADDLOCAL=Server',
+              'SERVER_REGISTER_AS_SERVICE=1', 'SERVER_ADD_FIREWALL_EXCEPTION=0', 'SERVER_ALLOW_SAS=1',
+              'SET_ALLOWLOOPBACK=1', 'VALUE_OF_ALLOWLOOPBACK=1',
+              'SET_LOOPBACKONLY=1', 'VALUE_OF_LOOPBACKONLY=1',
+              'SET_ACCEPTHTTPCONNECTIONS=1', 'VALUE_OF_ACCEPTHTTPCONNECTIONS=0',
+              'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1',
+              'SET_PASSWORD=1', "VALUE_OF_PASSWORD=$Env:VNC_PASSWORD",
+              'SET_VIEWONLYPASSWORD=1', "VALUE_OF_VIEWONLYPASSWORD=$Env:VNC_PASSWORD"
+          )
+          $setup = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) {
+              throw "TightVNC installation failed: $($setup.ExitCode)"
+          }
+          $config = Get-ItemProperty 'HKLM:\SOFTWARE\TightVNC\Server'
+          if ($config.LoopbackOnly -ne 1 -or $config.AllowLoopback -ne 1 -or $config.UseVncAuthentication -ne 1) {
+              throw 'TightVNC loopback/authentication configuration did not apply.'
+          }
+          Start-Service tvnserver
+          (Get-Service tvnserver).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+
+      - name: 3. Install noVNC, WebSocket Proxy and cloudflared
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $Env:WEB_DESKTOP_ROOT
+          python -m venv "$root\venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create Python environment.' }
+          $python = "$root\venv\Scripts\python.exe"
+          & $python -m pip install --disable-pip-version-check 'websockify==0.13.0' 'pycryptodome==3.23.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
+          Invoke-WebRequest 'https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip' -OutFile "$root\novnc.zip"
+          Expand-Archive "$root\novnc.zip" -DestinationPath $root
+          if (-not (Test-Path "$root\noVNC-1.6.0\vnc.html")) { throw 'noVNC files missing.' }
+          Invoke-WebRequest 'https://github.com/cloudflare/cloudflared/releases/download/2026.11.0/cloudflared-windows-amd64.exe' -OutFile "$root\cloudflared.exe"
+          if ((Get-FileHash "$root\cloudflared.exe" -Algorithm SHA256).Hash -ne 'd5c1d82031da6253dcdcff64c944cd0fe063016edeb2e4fd088075fc9bd52d0a') {
+              throw 'cloudflared SHA256 verification failed.'
+          }
+
+      - name: 4. Verify VNC Authentication and Start Web Proxy
+        timeout-minutes: 3
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $Env:WEB_DESKTOP_ROOT
+          $python = "$root\venv\Scripts\python.exe"
+          @'
+          import os, socket, struct, time
+          from Crypto.Cipher import DES
+
+          def read_exact(sock, length):
+              result = b""
+              while len(result) < length:
+                  data = sock.recv(length - len(result))
+                  if not data:
+                      raise RuntimeError("VNC closed the connection")
+                  result += data
+              return result
+
+          def authenticate(password):
+              with socket.create_connection(("127.0.0.1", 5900), timeout=10) as sock:
+                  banner = read_exact(sock, 12)
+                  if banner != b"RFB 003.008\n":
+                      raise RuntimeError("Expected RFB 3.8; refusing to skip authentication checks")
+                  sock.sendall(b"RFB 003.008\n")
+                  count = read_exact(sock, 1)[0]
+                  if count == 0:
+                      raise RuntimeError("VNC rejected negotiation")
+                  security = read_exact(sock, count)
+                  if 1 in security or 2 not in security:
+                      raise RuntimeError("Server must require VNC password authentication")
+                  sock.sendall(b"\x02")
+                  challenge = read_exact(sock, 16)
+                  key = bytes(int(f"{b:08b}"[::-1], 2) for b in password.encode("ascii"))
+                  sock.sendall(DES.new(key, DES.MODE_ECB).encrypt(challenge))
+                  return struct.unpack("!I", read_exact(sock, 4))[0]
+
+          password = os.environ["VNC_PASSWORD"]
+          for attempt in range(20):
+              try:
+                  with socket.create_connection(("127.0.0.1", 5900), timeout=2):
+                      break
+              except OSError:
+                  time.sleep(1)
+          if authenticate(password) != 0:
+              raise RuntimeError("Configured VNC password was rejected")
+          wrong = ("A" if password[0] != "A" else "B") + password[1:]
+          if authenticate(wrong) == 0:
+              raise RuntimeError("VNC accepted an incorrect password")
+          print("VNC authentication checks passed: password required, correct accepted, incorrect rejected.")
+          '@ | Set-Content "$root\check-vnc.py" -Encoding utf8
+          & $python "$root\check-vnc.py"
+          if ($LASTEXITCODE -ne 0) { throw 'VNC authentication validation failed; tunnel will not start.' }
+          Remove-Item Env:VNC_PASSWORD
+          $proxy = Start-Process $python -ArgumentList @(
+              '-m', 'websockify', '--web', "`"$root\noVNC-1.6.0`"", '127.0.0.1:16080', '127.0.0.1:5900'
+          ) -RedirectStandardOutput "$root\proxy.out.log" -RedirectStandardError "$root\proxy.err.log" -PassThru
+          $proxy.Id | Set-Content "$root\proxy.pid"
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+              $proxy.Refresh()
+              if ($proxy.HasExited) { throw 'WebSocket proxy exited. See proxy diagnostic step.' }
+              try {
+                  $response = Invoke-WebRequest 'http://127.0.0.1:16080/vnc.html' -TimeoutSec 3
+                  if ($response.StatusCode -eq 200) { $ready = $true; break }
+              } catch { }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $ready) { throw 'noVNC HTTP server did not become ready.' }
+          $listeners = @(Get-NetTCPConnection -LocalPort 16080 -State Listen)
+          if ($listeners.Count -ne 1 -or $listeners[0].LocalAddress -ne '127.0.0.1' -or $listeners[0].OwningProcess -ne $proxy.Id) {
+              throw 'Unexpected noVNC listener; refusing to open the tunnel.'
+          }
+
+      - name: 5. Start Cloudflare Tunnel and Show URL
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $Env:WEB_DESKTOP_ROOT
+          $tunnel = Start-Process "$root\cloudflared.exe" -ArgumentList @(
+              '--no-autoupdate', 'tunnel', '--url', 'http://127.0.0.1:16080', '--protocol', 'http2'
+          ) -RedirectStandardOutput "$root\tunnel.out.log" -RedirectStandardError "$root\tunnel.err.log" -PassThru
+          $tunnel.Id | Set-Content "$root\tunnel.pid"
+          $url = ''
+          for ($i = 0; $i -lt 60; $i++) {
+              $tunnel.Refresh()
+              if ($tunnel.HasExited) { throw 'cloudflared exited before creating the tunnel.' }
+              $log = Get-Content "$root\tunnel.err.log" -Raw -ErrorAction SilentlyContinue
+              if ($log -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
+                  $url = $Matches[0] + '/vnc.html?autoconnect=true&resize=scale&path=websockify'
+                  break
+              }
+              Start-Sleep -Seconds 2
+          }
+          if (-not $url) { throw 'Cloudflare did not return a Quick Tunnel URL.' }
+          Write-Host "Desktop URL: $url"
+          Write-Host 'VNC password: secret VNC_PASSWORD (not printed)'
+          Write-Host 'If Windows is locked: use noVNC Ctrl-Alt-Del, then .\runneradmin / secret RDP_PASSWORD.'
+          Write-Host 'HTTP page is public; the desktop is protected by VNC authentication. Do not share this URL.'
+          @"
+          ## Windows Web Desktop
+          - [Open noVNC desktop]($url)
+          - VNC password: your ``VNC_PASSWORD`` secret.
+          - Windows login: ``.\runneradmin`` / your ``RDP_PASSWORD`` secret.
+          - Allow a short delay for the tunnel to become reachable.
+          - Classic VNC has an eight-character password limit. Temporary testing only; use Cloudflare Access for sensitive workloads.
+          - All VM data is discarded when the job ends. Close the workflow to end access, not just the browser tab.
+          "@ >> $Env:GITHUB_STEP_SUMMARY
+
+      - name: 6. Keep Desktop Available
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $Env:WEB_DESKTOP_ROOT
+          for ($i = 1; $i -le [int]$Env:DURATION_MINUTES; $i++) {
+              Start-Sleep -Seconds 60
+              if ((Get-Service tvnserver).Status -ne 'Running') { throw 'TightVNC stopped.' }
+              foreach ($name in @('proxy', 'tunnel')) {
+                  $processId = [int](Get-Content "$root\$name.pid")
+                  if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { throw "$name stopped." }
+              }
+              Write-Host "[$i/$Env:DURATION_MINUTES] Desktop services running."
+          }
+
+      - name: Diagnostics on Failure
+        if: failure()
+        run: |
+          foreach ($name in @('proxy.err.log', 'tunnel.err.log')) {
+              $path = Join-Path $Env:WEB_DESKTOP_ROOT $name
+              if (Test-Path $path) { Get-Content $path -Tail 40 }
+          }
+
+      - name: Stop Desktop Services
+        if: always()
+        timeout-minutes: 2
+        run: |
+          if ($Env:WEB_DESKTOP_ROOT) {
+              foreach ($name in @('tunnel', 'proxy')) {
+                  $path = Join-Path $Env:WEB_DESKTOP_ROOT "$name.pid"
+                  if (Test-Path $path) {
+                      $processId = [int](Get-Content $path)
+                      taskkill.exe /PID $processId /T /F 2>$null | Out-Null
+                  }
+              }
+          }
+          $service = Get-Service tvnserver -ErrorAction SilentlyContinue
+          if ($service) { Stop-Service tvnserver -Force }
+          exit 0
